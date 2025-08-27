@@ -1,0 +1,370 @@
+volumes:
+  n8n_storage:
+  postgres_storage:
+  redis_storage:
+  chatwoot_storage:
+  evolution_storage:
+  mongo_storage:
+  ollama_storage:
+  qdrant_storage:
+
+networks:
+  demo:
+    driver: bridge
+
+# N8N Service Template
+x-n8n: &service-n8n
+  image: n8nio/n8n:latest
+  networks: 
+    - demo
+  environment:
+    DB_TYPE: postgresdb
+    DB_POSTGRESDB_HOST: postgres
+    DB_POSTGRESDB_USER: ${POSTGRES_USER}
+    DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+    DB_POSTGRESDB_DATABASE: ${N8N_DATABASE_DB}
+    N8N_DIAGNOSTICS_ENABLED: false
+    N8N_PERSONALIZATION_ENABLED: false
+    N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+    N8N_USER_MANAGEMENT_JWT_SECRET: ${N8N_USER_MANAGEMENT_JWT_SECRET}
+    OLLAMA_HOST: ${OLLAMA_HOST}
+  env_file:
+    - path: .env
+      required: true
+
+# Ollama Service Template
+x-ollama: &service-ollama
+  image: ollama/ollama:latest
+  networks: 
+    - demo
+  restart: unless-stopped
+  volumes:
+    - ollama_storage:/root/.ollama
+
+# Ollama Init Template
+x-init-ollama: &init-ollama
+  image: ollama/ollama:latest
+  networks: 
+    - demo
+  volumes:
+    - ollama_storage:/root/.ollama
+  entrypoint: /bin/sh
+  environment:
+    OLLAMA_HOST: ollama:11434
+  command:
+    - "-c"
+    - "sleep 3; ollama pull llama3.2"
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    hostname: postgres
+    container_name: postgres
+    networks: 
+      - demo
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_storage:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    hostname: redis
+    container_name: redis
+    networks:
+      - demo
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_storage:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ['CMD', 'redis-cli', '--raw', 'incr', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # MongoDB para Evolution API
+  mongodb:
+    image: mongo:7
+    hostname: mongodb
+    container_name: mongodb
+    networks: 
+      - demo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    volumes:
+      - mongo_storage:/data/db
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ['CMD','mongosh', '--eval', 'db.hello()']
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # Evolution API
+  evolution-api:
+    image: atendai/evolution-api:latest
+    hostname: evolution-api
+    container_name: evolution-api
+    networks: 
+      - demo
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SERVER_URL: http://localhost:8080
+      DATABASE_ENABLED: true
+      DATABASE_CONNECTION_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/?authSource=admin
+      DATABASE_CONNECTION_DB_NAME: evolution_api
+      API_KEY: ${EVOLUTION_API_KEY}
+      CORS_ORIGIN: "*"
+      CORS_METHODS: "GET,HEAD,PUT,PATCH,POST,DELETE"
+      CORS_CREDENTIALS: true
+    volumes:
+      - evolution_storage:/evolution/instances
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:8080/manager/status']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Chatwoot Database Setup
+  chatwoot-prepare:
+    image: chatwoot/chatwoot:v3.12.0
+    container_name: chatwoot-prepare
+    networks: 
+      - demo
+    command: sh -c "bundle exec rails db:chatwoot_prepare && bundle exec rails db:seed"
+    environment:
+      NODE_ENV: production
+      RAILS_ENV: production
+      INSTALLATION_ENV: docker-compose
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_USERNAME: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DATABASE: ${CHATWOOT_POSTGRES_DATABASE}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      FRONTEND_URL: ${FRONTEND_URL}
+      MAILER_SENDER_EMAIL: ${MAILER_SENDER_EMAIL}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      FORCE_SSL: false
+      ENABLE_ACCOUNT_SIGNUP: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Chatwoot Web Application
+  chatwoot-web:
+    image: chatwoot/chatwoot:v3.12.0
+    hostname: chatwoot-web
+    container_name: chatwoot-web
+    networks: 
+      - demo
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      RAILS_ENV: production
+      INSTALLATION_ENV: docker-compose
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_USERNAME: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DATABASE: ${CHATWOOT_POSTGRES_DATABASE}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      FRONTEND_URL: ${FRONTEND_URL}
+      MAILER_SENDER_EMAIL: ${MAILER_SENDER_EMAIL}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      FORCE_SSL: false
+      ENABLE_ACCOUNT_SIGNUP: false
+    volumes:
+      - chatwoot_storage:/app/storage
+    depends_on:
+      chatwoot-prepare:
+        condition: service_completed_successfully
+
+  # N8N Import (executa uma vez para importar dados demo)
+  n8n-import:
+    <<: *service-n8n
+    hostname: n8n-import
+    container_name: n8n-import
+    entrypoint: /bin/sh
+    command:
+      - "-c"
+      - "n8n import:credentials --separate --input=/demo-data/credentials && n8n import:workflow --separate --input=/demo-data/workflows"
+    volumes:
+      - ./n8n/demo-data:/demo-data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - n8n
+
+  # N8N Main Application
+  n8n:
+    <<: *service-n8n
+    hostname: n8n
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_storage:/home/node/.n8n
+      - ./n8n/demo-data:/demo-data
+      - ./shared:/data/shared
+    depends_on:
+      postgres:
+        condition: service_healthy
+      n8n-import:
+        condition: service_completed_successfully
+    profiles:
+      - n8n
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:5678/healthz']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Qdrant Vector Database
+  qdrant:
+    image: qdrant/qdrant
+    hostname: qdrant
+    container_name: qdrant
+    networks: 
+      - demo
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    profiles:
+      - ai
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:6333/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Ollama CPU Version
+  ollama-cpu:
+    profiles: ["cpu"]
+    <<: *service-ollama
+    container_name: ollama-cpu
+    ports:
+      - "11434:11434"
+
+  # Ollama GPU NVIDIA Version
+  ollama-gpu:
+    profiles: ["gpu-nvidia"]
+    <<: *service-ollama
+    container_name: ollama-gpu-nvidia
+    ports:
+      - "11434:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Ollama GPU AMD Version
+  ollama-gpu-amd:
+    profiles: ["gpu-amd"]
+    <<: *service-ollama
+    container_name: ollama-gpu-amd
+    image: ollama/ollama:rocm
+    ports:
+      - "11434:11434"
+    devices:
+      - "/dev/kfd"
+      - "/dev/dri"
+
+  # Ollama Model Pull for CPU
+  ollama-pull-llama-cpu:
+    profiles: ["cpu"]
+    <<: *init-ollama
+    container_name: ollama-pull-llama-cpu
+    depends_on:
+      - ollama-cpu
+
+  # Ollama Model Pull for GPU NVIDIA
+  ollama-pull-llama-gpu-nvidia:
+    profiles: ["gpu-nvidia"]
+    <<: *init-ollama
+    container_name: ollama-pull-llama-gpu-nvidia
+    depends_on:
+      - ollama-gpu
+
+  # Ollama Model Pull for GPU AMD
+  ollama-pull-llama-gpu-amd:
+    profiles: ["gpu-amd"]
+    <<: *init-ollama
+    container_name: ollama-pull-llama-gpu-amd
+    image: ollama/ollama:rocm
+    depends_on:
+      - ollama-gpu-amd
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:3000/api/v1/status']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Chatwoot Background Worker
+  chatwoot-worker:
+    image: chatwoot/chatwoot:v3.12.0
+    hostname: chatwoot-worker
+    container_name: chatwoot-worker
+    networks: 
+      - demo
+    restart: unless-stopped
+    command: bundle exec sidekiq -C config/sidekiq.yml
+    environment:
+      NODE_ENV: production
+      RAILS_ENV: production
+      INSTALLATION_ENV: docker-compose
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_USERNAME: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DATABASE: ${CHATWOOT_POSTGRES_DATABASE}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      FRONTEND_URL: ${FRONTEND_URL}
+      MAILER_SENDER_EMAIL: ${MAILER_SENDER_EMAIL}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      FORCE_SSL: false
+    volumes:
+      - chatwoot_storage:/app/storage
+    depends_on:
+      chatwoot-prepare:
+        condition: service_completed_successfully
